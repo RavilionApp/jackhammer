@@ -32,6 +32,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to load S3 config")
 	}
 	s3Client := s3.NewFromConfig(s3Config, func(o *s3.Options) { o.UsePathStyle = true })
+	redis := NewRedis()
 
 	log.Info().Msg("using ffmpeg backend")
 	backend := FfmpegBackend{}
@@ -69,33 +70,56 @@ func main() {
 				continue
 			}
 
+			if redis != nil {
+				if err := redis.PublishNotification(msg.JobID, JobStatusQueued); err != nil {
+					log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to publish the notification")
+					message.Nack(false, true)
+					continue
+				}
+			}
+
 			tempDirPath, err := os.MkdirTemp("", "transcode")
 			if err != nil {
-				log.Error().Err(err).Msg("failed to create the temp directory")
+				log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to create the temp directory")
 				message.Nack(false, true)
 				continue
 			}
 
 			command, err := backend.buildCmd(msg.RawURL)
 			if err != nil {
-				log.Error().Err(err).Msg("failed to prepare the command")
+				log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to prepare the command")
 				message.Nack(false, true)
 				continue
+			}
+
+			if redis != nil {
+				if err := redis.PublishNotification(msg.JobID, JobStatusTranscoding); err != nil {
+					log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to publish the notification")
+					message.Nack(false, true)
+					continue
+				}
 			}
 
 			command.Dir = tempDirPath
 			backend.setupLogOutput(command, &logBuffer)
 			if err := command.Run(); err != nil {
-				log.Error().Err(err).Msg("failed to execute the command")
+				log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to execute the command")
 				message.Nack(false, true)
 				continue
 			}
 
 			log.Info().Msg("successfully executed the command")
+			if redis != nil {
+				if err := redis.PublishNotification(msg.JobID, JobStatusUploading); err != nil {
+					log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to publish the notification")
+					message.Nack(false, true)
+					continue
+				}
+			}
 
 			entries, err := os.ReadDir(tempDirPath)
 			if err != nil {
-				log.Error().Err(err).Str("path", tempDirPath).Msg("failed to read the output directory")
+				log.Error().Err(err).Str("jobId", msg.JobID).Str("path", tempDirPath).Msg("failed to read the output directory")
 				message.Nack(false, true)
 				continue
 			}
@@ -106,7 +130,7 @@ func main() {
 				filePath := filepath.Join(tempDirPath, entry.Name())
 				file, err := os.Open(filePath)
 				if err != nil {
-					log.Error().Err(err).Str("path", filePath).Msg("failed to open the file")
+					log.Error().Err(err).Str("jobId", msg.JobID).Str("path", filePath).Msg("failed to open the file")
 					message.Nack(false, true)
 					break
 				}
@@ -118,22 +142,29 @@ func main() {
 					// TODO: caching and content type
 				})
 				if err != nil {
-					log.Error().Err(err).Str("path", filePath).Msg("failed to upload the file")
+					log.Error().Err(err).Str("jobId", msg.JobID).Str("path", filePath).Msg("failed to upload the file")
 					message.Nack(false, true)
 					break
 				}
 
 				log.Info().Str("path", filePath).Msg("successfully uploaded the file")
 				if err := file.Close(); err != nil {
-					log.Error().Err(err).Str("path", filePath).Msg("failed to close the file")
+					log.Error().Err(err).Str("jobId", msg.JobID).Str("path", filePath).Msg("failed to close the file")
 				}
 			}
 
 			if err := message.Ack(false); err != nil {
-				log.Error().Err(err).Msg("failed to ack the request")
+				log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to ack the request")
 			}
 			if err := os.RemoveAll(tempDirPath); err != nil {
-				log.Error().Err(err).Msg("failed to clean up the temp directory")
+				log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to clean up the temp directory")
+			}
+			if redis != nil {
+				if err := redis.PublishNotification(msg.JobID, JobStatusFinished); err != nil {
+					log.Error().Err(err).Str("jobId", msg.JobID).Msg("failed to publish the notification")
+					message.Nack(false, true)
+					continue
+				}
 			}
 		}
 	}()
